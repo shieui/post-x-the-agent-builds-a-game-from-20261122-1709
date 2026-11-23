@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Star Catcher — one prompt, one game</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #0b1026;
+    overflow: hidden;
+    font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+  }
+  #stage {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    display: block;
+    background: linear-gradient(180deg, #141a3d 0%, #1d2450 55%, #2c1e56 100%);
+    touch-action: none;
+  }
+  #hint {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 10px;
+    text-align: center;
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 15px;
+    pointer-events: none;
+    letter-spacing: 0.04em;
+  }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="game" width="1080" height="1920"></canvas></div>
+<div id="hint">← → move &nbsp;·&nbsp; catch the stars &nbsp;·&nbsp; 60 seconds</div>
+<script src="game.js"></script>
+</body>
+</html>
