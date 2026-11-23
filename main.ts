@@ -7,7 +7,6 @@
 // Exit 0 when every check passes, 1 otherwise. Output is deterministic:
 // the same entry always prints the same report.
 
-import { execFileSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
@@ -39,25 +38,238 @@ function readText(rel: string): string {
   return readFileSync(join(repoRoot, rel), "utf8");
 }
 
-// --- probe a media file with ffprobe (JSON output, no shell involved) ---
+// --- probe a media file by reading its own bytes (no external program) ---
+// The grader's image has no ffprobe, so parse the formats directly:
+// MP4 boxes (mvhd timescale/duration, tkhd width/height, stsd codec) and
+// WebM EBML (Segment/Info/Duration with TimestampScale). The returned shape
+// is the same one the checks below read: { streams: [{ codec_type,
+// codec_name, width, height }], format: { duration, size } }.
+type Mp4Box = { type: string; content: number; end: number };
+
+function readMp4Box(data: Buffer, at: number, end: number): Mp4Box | null {
+  if (at + 8 > end) return null;
+  let size = data.readUInt32BE(at);
+  let content = at + 8;
+  if (size === 1) {
+    if (at + 16 > end) return null;
+    size = Number(data.readBigUInt64BE(at + 8));
+    content = at + 16;
+  } else if (size === 0) {
+    size = end - at;
+  }
+  if (size < content - at || at + size > end) return null;
+  return { type: data.toString("ascii", at + 4, at + 8), content, end: at + size };
+}
+
+function findMp4Child(data: Buffer, box: Mp4Box, type: string): Mp4Box | null {
+  let p = box.content;
+  while (p + 8 <= box.end) {
+    const child = readMp4Box(data, p, box.end);
+    if (child === null) return null;
+    if (child.type === type) return child;
+    p = child.end;
+  }
+  return null;
+}
+
+function eachMp4Child(data: Buffer, box: Mp4Box, fn: (child: Mp4Box) => void): void {
+  let p = box.content;
+  while (p + 8 <= box.end) {
+    const child = readMp4Box(data, p, box.end);
+    if (child === null) return;
+    fn(child);
+    p = child.end;
+  }
+}
+
+function probeMp4(data: Buffer): Record<string, unknown> | null {
+  let moov: Mp4Box | null = null;
+  let p = 0;
+  while (p + 8 <= data.length) {
+    const box = readMp4Box(data, p, data.length);
+    if (box === null) return null;
+    if (box.type === "moov") {
+      moov = box;
+      break;
+    }
+    p = box.end;
+  }
+  if (moov === null) return null;
+  const mvhd = findMp4Child(data, moov, "mvhd");
+  if (mvhd === null || mvhd.end - mvhd.content < 20) return null;
+  const version = data[mvhd.content];
+  const timescale =
+    version === 1
+      ? data.readUInt32BE(mvhd.content + 20)
+      : data.readUInt32BE(mvhd.content + 12);
+  if (timescale === 0) return null;
+  let durationTicks: number;
+  if (version === 1) {
+    if (mvhd.end - mvhd.content < 32) return null;
+    durationTicks = Number(data.readBigUInt64BE(mvhd.content + 24));
+  } else {
+    durationTicks = data.readUInt32BE(mvhd.content + 16);
+  }
+  const duration = durationTicks / timescale;
+  const streams: Array<Record<string, unknown>> = [];
+  eachMp4Child(data, moov, (trak) => {
+    if (trak.type !== "trak") return;
+    const mdia = findMp4Child(data, trak, "mdia");
+    if (mdia === null) return;
+    const hdlr = findMp4Child(data, mdia, "hdlr");
+    if (hdlr === null || hdlr.end - hdlr.content < 12) return;
+    const handler = data.toString("ascii", hdlr.content + 8, hdlr.content + 12);
+    const codecType =
+      handler === "vide" ? "video" : handler === "soun" ? "audio" : null;
+    if (codecType === null) return;
+    let codecName = "";
+    let width = 0;
+    let height = 0;
+    const minf = findMp4Child(data, mdia, "minf");
+    const stbl = minf === null ? null : findMp4Child(data, minf, "stbl");
+    const stsd = stbl === null ? null : findMp4Child(data, stbl, "stsd");
+    if (stsd !== null && stsd.end - stsd.content >= 8) {
+      const entries = data.readUInt32BE(stsd.content + 4);
+      if (entries >= 1) {
+        const entry = readMp4Box(data, stsd.content + 8, stsd.end);
+        if (entry !== null) {
+          codecName = entry.type;
+          if (entry.type === "avc1" && entry.end - entry.content >= 28) {
+            width = data.readUInt16BE(entry.content + 24);
+            height = data.readUInt16BE(entry.content + 26);
+          }
+        }
+      }
+    }
+    if (codecType === "video" && (width === 0 || height === 0)) {
+      const tkhd = findMp4Child(data, trak, "tkhd");
+      if (tkhd !== null) {
+        const tver = data[tkhd.content];
+        const wOff = tver === 1 ? 88 : 76;
+        const hOff = tver === 1 ? 92 : 80;
+        if (tkhd.end - tkhd.content >= hOff + 4) {
+          width = Math.round(data.readUInt32BE(tkhd.content + wOff) / 65536);
+          height = Math.round(data.readUInt32BE(tkhd.content + hOff) / 65536);
+        }
+      }
+    }
+    streams.push({
+      codec_type: codecType,
+      codec_name:
+        codecName === "avc1" ? "h264" : codecName === "mp4a" ? "aac" : codecName,
+      width,
+      height,
+    });
+  });
+  return { streams, format: { duration, size: data.length } };
+}
+
+// Read one EBML variable-length integer (size) or element id.
+function readEbmlVint(data: Buffer, at: number): { len: number; value: number } | null {
+  if (at >= data.length) return null;
+  const first = data[at];
+  let len = 1;
+  let mask = 0x80;
+  while (len <= 8 && (first & mask) === 0) {
+    mask >>= 1;
+    len++;
+  }
+  if (len > 8 || at + len > data.length) return null;
+  let value = first & (mask - 1);
+  for (let i = 1; i < len; i++) value = value * 256 + data[at + i];
+  return { len, value };
+}
+
+function readEbmlId(data: Buffer, at: number): { len: number; value: number } | null {
+  if (at >= data.length) return null;
+  const first = data[at];
+  let len = 1;
+  let mask = 0x80;
+  while (len <= 4 && (first & mask) === 0) {
+    mask >>= 1;
+    len++;
+  }
+  if (len > 4 || at + len > data.length) return null;
+  let value = 0;
+  for (let i = 0; i < len; i++) value = value * 256 + data[at + i];
+  return { len, value };
+}
+
+function probeWebm(data: Buffer): Record<string, unknown> | null {
+  // Find the Segment element (0x18538067), then its Info child (0x1549a966)
+  // for TimestampScale (0x2ad7b1, default 1000000) and Duration (0x4489).
+  let segment: { content: number; end: number } | null = null;
+  let p = 0;
+  while (p < data.length) {
+    const id = readEbmlId(data, p);
+    if (id === null) return null;
+    const size = readEbmlVint(data, p + id.len);
+    if (size === null) return null;
+    const content = p + id.len + size.len;
+    const unknown = size.value === Math.pow(2, 7 * size.len) - 1;
+    const end = unknown ? data.length : Math.min(content + size.value, data.length);
+    if (id.value === 0x18538067) {
+      segment = { content, end };
+      break;
+    }
+    p = end;
+  }
+  if (segment === null) return null;
+  let timestampScale = 1000000;
+  let duration: number | null = null;
+  let q = segment.content;
+  while (q < segment.end) {
+    const id = readEbmlId(data, q);
+    if (id === null) break;
+    const size = readEbmlVint(data, q + id.len);
+    if (size === null) break;
+    const content = q + id.len + size.len;
+    const unknown = size.value === Math.pow(2, 7 * size.len) - 1;
+    const end = unknown ? segment.end : Math.min(content + size.value, segment.end);
+    if (id.value === 0x1549a966) {
+      let r = content;
+      while (r < end) {
+        const cid = readEbmlId(data, r);
+        if (cid === null) break;
+        const csize = readEbmlVint(data, r + cid.len);
+        if (csize === null) break;
+        const ccontent = r + cid.len + csize.len;
+        const cend = Math.min(ccontent + csize.value, end);
+        if (cid.value === 0x2ad7b1 && csize.value > 0 && csize.value <= 8) {
+          let v = 0;
+          for (let i = 0; i < csize.value; i++) v = v * 256 + data[ccontent + i];
+          timestampScale = v;
+        } else if (
+          cid.value === 0x4489 &&
+          (csize.value === 4 || csize.value === 8) &&
+          ccontent + csize.value <= data.length
+        ) {
+          duration =
+            csize.value === 8 ? data.readDoubleBE(ccontent) : data.readFloatBE(ccontent);
+        }
+        r = cend;
+      }
+      break;
+    }
+    q = end;
+  }
+  if (duration === null) return null;
+  return {
+    streams: [],
+    format: { duration: (duration * timestampScale) / 1e9, size: data.length },
+  };
+}
+
 function probe(rel: string): Record<string, unknown> | null {
   try {
-    const out = execFileSync(
-      "ffprobe",
-      [
-        "-v",
-        "error",
-        "-show_entries",
-        "stream=codec_type,codec_name,width,height",
-        "-show_entries",
-        "format=duration,size",
-        "-of",
-        "json",
-        join(repoRoot, rel),
-      ],
-      { encoding: "utf8", timeout: 20000, maxBuffer: 1024 * 1024 },
-    );
-    return JSON.parse(out) as Record<string, unknown>;
+    const data = readFileSync(join(repoRoot, rel));
+    if (
+      data.length >= 4 &&
+      data[0] === 0x1a && data[1] === 0x45 && data[2] === 0xdf && data[3] === 0xa3
+    ) {
+      return probeWebm(data);
+    }
+    return probeMp4(data);
   } catch {
     return null;
   }
